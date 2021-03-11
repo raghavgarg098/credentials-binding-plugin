@@ -24,12 +24,15 @@ package org.jenkinsci.plugins.credentialsbinding.impl;
 
 import com.cloudbees.jenkins.plugins.sshcredentials.SSHUserPrivateKey;
 import com.google.common.collect.ImmutableSet;
+import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
 import hudson.FilePath;
 import hudson.Launcher;
 import hudson.model.Run;
 import hudson.model.TaskListener;
 import hudson.util.Secret;
+import java.io.File;
+import java.io.PrintWriter;
 import org.jenkinsci.Symbol;
 import org.jenkinsci.plugins.credentialsbinding.BindingDescriptor;
 import org.jenkinsci.plugins.credentialsbinding.MultiBinding;
@@ -99,11 +102,13 @@ public class GitSSHUserPrivateKeyBinding extends MultiBinding<SSHUserPrivateKey>
       contents.append('\n');
     }
     keyFile.write(contents.toString(), "UTF-8");
-    keyFile.chmod(0400);
+    keyFile.chmod(0777);
+
+    File ssh =  createUnixGitSSH(keyFile, sshKey.getUsername());
 
     Map<String, String> map = new LinkedHashMap<>();
     map.put(keyFileVariable, keyFile.getRemote());
-    map.put("GIT_SSH", keyFile.getRemote());
+    map.put("GIT_SSH", ssh.toString());
     map.put("GIT_SSH_VARIANT", "ssh");
     if (passphraseVariable != null) {
       Secret passphrase = sshKey.getPassphrase();
@@ -132,6 +137,32 @@ public class GitSSHUserPrivateKeyBinding extends MultiBinding<SSHUserPrivateKey>
       return Messages.GitSSHUserPrivateKeyBinding_git_ssh_user_private_key();
     }
 
+  }
+
+  private File createUnixSshAskpass(FilePath key) throws IOException {
+    File pass = new File("pass", "-pass");
+    try (PrintWriter w = new PrintWriter(pass, "UTF-8")) {
+      w.println("#!/bin/sh");
+      w.println("echo");
+    }
+    pass.setExecutable(true, true);
+    return pass;
+  }
+
+  private File createUnixGitSSH(FilePath key, String user) throws IOException {
+    File ssh = new File(key.toString() + "-copy");
+    boolean isCopied = false;
+    try (PrintWriter w = new PrintWriter(ssh, "UTF-8")) {
+      w.println("#!/bin/sh");
+      // ${SSH_ASKPASS} might be ignored if ${DISPLAY} is not set
+      w.println("if [ -z \"${DISPLAY}\" ]; then");
+      w.println("  DISPLAY=:123.456");
+      w.println("  export DISPLAY");
+      w.println("fi");
+      w.println("ssh -i \"" + key.toString() + "\" -l \"" + user + "\" -o StrictHostKeyChecking=no \"$@\"");
+    }
+    ssh.setExecutable(true, true);
+    return ssh;
   }
 
 }
