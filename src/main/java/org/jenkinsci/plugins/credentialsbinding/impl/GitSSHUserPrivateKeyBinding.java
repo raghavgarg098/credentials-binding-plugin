@@ -42,13 +42,24 @@ import org.kohsuke.stapler.DataBoundSetter;
 import javax.annotation.CheckForNull;
 import javax.annotation.Nonnull;
 import java.io.IOException;
+import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.*;
 
 public class GitSSHUserPrivateKeyBinding extends MultiBinding<SSHUserPrivateKey> {
 
+  String gitExe;
   public final String keyFileVariable;
   public String usernameVariable;
   public String passphraseVariable;
+  private String encoding;
+  TaskListener listener;
+
 
   @DataBoundConstructor public GitSSHUserPrivateKeyBinding(@Nonnull String keyFileVariable, String credentialsId) {
     super(credentialsId);
@@ -103,18 +114,28 @@ public class GitSSHUserPrivateKeyBinding extends MultiBinding<SSHUserPrivateKey>
     }
     keyFile.write(contents.toString(), "UTF-8");
     keyFile.chmod(0777);
-
-    File ssh =  createUnixGitSSH(keyFile, sshKey.getUsername());
+    File ssh;
+    File passphrase = null;
+    File askpass = null;
+    passphrase = createPassphraseFile(sshKey, keyFile);
+    if (launcher.isUnix()) {
+       ssh = createUnixGitSSH(keyFile, sshKey.getUsername());
+       askpass =  createUnixSshAskpass(passphrase);
+    }
+    else
+    {
+      ssh = createWindowsGitSSH(keyFile, sshKey.getUsername());
+      askpass =  createWindowsSshAskpass(passphrase);
+    }
 
     Map<String, String> map = new LinkedHashMap<>();
     map.put(keyFileVariable, keyFile.getRemote());
     map.put("GIT_SSH", ssh.toString());
     map.put("GIT_SSH_VARIANT", "ssh");
     if (passphraseVariable != null) {
-      Secret passphrase = sshKey.getPassphrase();
-      if (passphrase != null) {
-        map.put(passphraseVariable, passphrase.getPlainText());
-        map.put("SSH_ASKPASS", passphrase.getPlainText());
+      if (sshKey.getPassphrase() != null) {
+        map.put(passphraseVariable, sshKey.getPassphrase().getPlainText());
+        map.put("SSH_ASKPASS", askpass.getAbsolutePath());
       } else {
         map.put(passphraseVariable, "");
       }
@@ -139,11 +160,156 @@ public class GitSSHUserPrivateKeyBinding extends MultiBinding<SSHUserPrivateKey>
 
   }
 
-  private File createUnixSshAskpass(FilePath key) throws IOException {
-    File pass = new File("pass", "-pass");
+  private File getFileFromEnv(String envVar, String suffix) {
+    String envValue = System.getenv(envVar);
+    if (envValue == null) {
+      return null;
+    }
+    return new File(envValue + suffix);
+  }
+
+  private File getSSHExeFromGitExeParentDir(String userGitExe) {
+    String parentPath = new File(userGitExe).getParent();
+    if (parentPath == null) {
+      return null;
+    }
+    return new File(parentPath + "\\ssh.exe");
+  }
+
+  private String getPathToExe(String userGitExe) {
+    userGitExe = userGitExe.toLowerCase(Locale.ENGLISH); // Avoid the Turkish 'i' conversion
+
+    String cmd;
+    String exe;
+    if (userGitExe.endsWith(".exe")) {
+      cmd = userGitExe.replace(".exe", ".cmd");
+      exe = userGitExe;
+    } else if (userGitExe.endsWith(".cmd")) {
+      cmd = userGitExe;
+      exe = userGitExe.replace(".cmd", ".exe");
+    } else {
+      cmd = userGitExe + ".cmd";
+      exe = userGitExe + ".exe";
+    }
+
+    String[] pathDirs = System.getenv("PATH").split(File.pathSeparator);
+
+    for (String pathDir : pathDirs) {
+      File exeFile = new File(pathDir, exe);
+      if (exeFile.exists()) {
+        return exeFile.getAbsolutePath();
+      }
+      File cmdFile = new File(pathDir, cmd);
+      if (cmdFile.exists()) {
+        return cmdFile.getAbsolutePath();
+      }
+    }
+
+    File userGitFile = new File(userGitExe);
+    if (userGitFile.exists()) {
+      return userGitFile.getAbsolutePath();
+    }
+
+    return null;
+  }
+
+
+
+  /* package */ File getSSHExecutable() {
+    // First check the GIT_SSH environment variable
+    File sshexe = getFileFromEnv("GIT_SSH", "");
+    if (sshexe != null && sshexe.exists()) {
+      return sshexe;
+    }
+
+    // Check Program Files
+    sshexe = getFileFromEnv("ProgramFiles", "\\Git\\bin\\ssh.exe");
+    if (sshexe != null && sshexe.exists()) {
+      return sshexe;
+    }
+    sshexe = getFileFromEnv("ProgramFiles", "\\Git\\usr\\bin\\ssh.exe");
+    if (sshexe != null && sshexe.exists()) {
+      return sshexe;
+    }
+
+    // Check Program Files(x86) for 64 bit computer
+    sshexe = getFileFromEnv("ProgramFiles(x86)", "\\Git\\bin\\ssh.exe");
+    if (sshexe != null && sshexe.exists()) {
+      return sshexe;
+    }
+    sshexe = getFileFromEnv("ProgramFiles(x86)", "\\Git\\usr\\bin\\ssh.exe");
+    if (sshexe != null && sshexe.exists()) {
+      return sshexe;
+    }
+
+    // Search for an ssh.exe near the git executable.
+    sshexe = getSSHExeFromGitExeParentDir(gitExe);
+    if (sshexe != null && sshexe.exists()) {
+      return sshexe;
+    }
+
+    // Search for git on the PATH, then look near it
+    String gitPath = getPathToExe(gitExe);
+    if (gitPath != null) {
+      sshexe = getSSHExeFromGitExeParentDir(gitPath.replace("/bin/", "/usr/bin/").replace("\\bin\\", "\\usr\\bin\\"));
+      if (sshexe != null && sshexe.exists()) {
+        return sshexe;
+      }
+      // In case we are using msysgit from the cmd directory
+      // instead of the bin directory, replace cmd with bin in
+      // the path while trying to find ssh.exe.
+      sshexe = getSSHExeFromGitExeParentDir(gitPath.replace("/cmd/", "/bin/").replace("\\cmd\\", "\\bin\\"));
+      if (sshexe != null && sshexe.exists()) {
+        return sshexe;
+      }
+      sshexe = getSSHExeFromGitExeParentDir(gitPath.replace("/cmd/", "/usr/bin/").replace("\\cmd\\", "\\usr\\bin\\"));
+      if (sshexe != null && sshexe.exists()) {
+        return sshexe;
+      }
+      sshexe = getSSHExeFromGitExeParentDir(gitPath.replace("/mingw64/", "/").replace("\\mingw64\\", "\\"));
+      if (sshexe != null && sshexe.exists()) {
+        return sshexe;
+      }
+      sshexe = getSSHExeFromGitExeParentDir(gitPath.replace("/mingw64/bin/", "/usr/bin/").replace("\\mingw64\\bin\\", "\\usr\\bin\\"));
+      if (sshexe != null && sshexe.exists()) {
+        return sshexe;
+      }
+    }
+
+    throw new RuntimeException("ssh executable not found. The git plugin only supports official git client http://git-scm.com/download/win");
+  }
+
+  private File createPassphraseFile(SSHUserPrivateKey sshUser, FilePath keyFile) throws IOException {
+    File passphraseFile =new File(keyFile.toString() + "_passphrase.txt");
+    try (PrintWriter w = new PrintWriter(passphraseFile, "UTF-8"))
+    {
+      w.println(Secret.toString(sshUser.getPassphrase()));
+
+    }
+    return passphraseFile;
+  }
+
+  private String unixArgEncodeFileName(String filename) {
+    if (filename.contains("'")) {
+      filename = filename.replace("'", "'\\''");
+    }
+    return "'" + filename + "'";
+  }
+
+  private String windowsArgEncodeFileName(String filename) {
+    if (filename.contains("\"")) {
+      filename = filename.replace("\"", "^\"");
+    }
+    return "\"" + filename + "\"";
+  }
+
+
+
+  private File createUnixSshAskpass(File key) throws IOException {
+    File pass = new File(key.toString(), "pass-copy");
     try (PrintWriter w = new PrintWriter(pass, "UTF-8")) {
       w.println("#!/bin/sh");
-      w.println("echo");
+      w.println("cat " + unixArgEncodeFileName(key.toString()));
     }
     pass.setExecutable(true, true);
     return pass;
@@ -165,4 +331,29 @@ public class GitSSHUserPrivateKeyBinding extends MultiBinding<SSHUserPrivateKey>
     return ssh;
   }
 
+
+  private File createWindowsSshAskpass(File key) throws IOException {
+    File ssh = new File(key.toString(), "pass-copy.bat");
+    try (PrintWriter w = new PrintWriter(ssh, "UTF-8"))
+    {
+      // avoid echoing command as part of the password
+      w.println("@echo off");
+      w.println("type " + windowsArgEncodeFileName(key.toString()));
+    }
+    ssh.setExecutable(true, true);
+    return ssh;
+  }
+
+  private File createWindowsGitSSH(FilePath key, String user) throws IOException {
+    File ssh = new File(key.toString() + "-copy.bat");
+
+    File sshexe = getSSHExecutable();
+
+    try (PrintWriter w = new PrintWriter(ssh, "UTF-8")) {
+      w.println("@echo off");
+      w.println("\"" + sshexe.getAbsolutePath() + "\" -i \"" + key.toString() +"\" -l \"" + user + "\" -o StrictHostKeyChecking=no %* ");
+    }
+    ssh.setExecutable(true, true);
+    return ssh;
+  }
 }
